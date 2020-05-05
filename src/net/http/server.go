@@ -2321,8 +2321,10 @@ func (mux *ServeMux) shouldRedirectRLocked(host, path string) bool {
 // Handler returns a ``page not found'' handler and an empty pattern.
 func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 
+	// 如果请求的方法是"CONNECT", 那么就去重定向其handler
 	// CONNECT requests are not canonicalized.
 	if r.Method == "CONNECT" {
+		// 可以看到, 返回的是 RedirectHandler, 用于连接其他Server
 		// If r.URL.Path is /tree and its handler is not registered,
 		// the /tree -> /tree/ redirect applies to CONNECT requests
 		// but the path canonicalization does not.
@@ -2333,11 +2335,13 @@ func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 		return mux.handler(r.Host, r.URL.Path)
 	}
 
+	// 处理得到 hostname 与 urlpath
 	// All other requests have any port stripped and path cleaned
 	// before passing to mux.handler.
 	host := stripHostPort(r.Host)
 	path := cleanPath(r.URL.Path)
 
+	// 如果对应的path不存在, 那么会尝试重定向路径
 	// If the given path is /tree and its handler is not registered,
 	// redirect for /tree/.
 	if u, ok := mux.redirectToPathSlash(host, path, r.URL); ok {
@@ -2351,6 +2355,7 @@ func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
 		return RedirectHandler(url.String(), StatusMovedPermanently), pattern
 	}
 
+	// 返回path对应的handler
 	return mux.handler(host, r.URL.Path)
 }
 
@@ -2360,13 +2365,16 @@ func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
 	mux.mu.RLock()
 	defer mux.mu.RUnlock()
 
+	// 如果有path包含hostname, 先使用 host+paths 搜索
 	// Host-specific pattern takes precedence over generic ones
 	if mux.hosts {
 		h, pattern = mux.match(host + path)
 	}
+	// 没有Handler, 使用 path 搜索
 	if h == nil {
 		h, pattern = mux.match(path)
 	}
+	// 还是没有Handler, 返回
 	if h == nil {
 		h, pattern = NotFoundHandler(), ""
 	}
@@ -2376,6 +2384,7 @@ func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
 // ServeHTTP dispatches the request to the handler whose
 // pattern most closely matches the request URL.
 func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+	// 如果请求的URI为"*", response code 400
 	if r.RequestURI == "*" {
 		if r.ProtoAtLeast(1, 1) {
 			w.Header().Set("Connection", "close")
@@ -2383,6 +2392,7 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 		w.WriteHeader(StatusBadRequest)
 		return
 	}
+	// 得到对应的handler, 调用 Handler.ServeHTTP
 	h, _ := mux.Handler(r)
 	h.ServeHTTP(w, r)
 }
@@ -2393,6 +2403,7 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 
+	// 检测[pattern]与handler
 	if pattern == "" {
 		panic("http: invalid pattern")
 	}
@@ -2403,6 +2414,7 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 		panic("http: multiple registrations for " + pattern)
 	}
 
+	// 创建muxEntry, 记录到<m>与<es>
 	if mux.m == nil {
 		mux.m = make(map[string]muxEntry)
 	}
@@ -2412,6 +2424,7 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 		mux.es = appendSorted(mux.es, e)
 	}
 
+	// 如果pattern不是'/', 那么认为包含hostname
 	if pattern[0] != '/' {
 		mux.hosts = true
 	}
@@ -2619,11 +2632,15 @@ func (s *Server) closeDoneChanLocked() {
 // Close returns any error returned from closing the Server's
 // underlying Listener(s).
 func (srv *Server) Close() error {
+	// 置位 <inShutdown>
 	atomic.StoreInt32(&srv.inShutdown, 1)
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
+	// clost <doneChan>
 	srv.closeDoneChanLocked()
+	// close <listener> 所有的 net.Listener
 	err := srv.closeListenersLocked()
+	// close <activeConn> 所有的conn
 	for c := range srv.activeConn {
 		c.rwc.Close()
 		delete(srv.activeConn, c)
@@ -2661,16 +2678,22 @@ var shutdownPollInterval = 500 * time.Millisecond
 // Once Shutdown has been called on a server, it may not be reused;
 // future calls to methods such as Serve will return ErrServerClosed.
 func (srv *Server) Shutdown(ctx context.Context) error {
+	// 置位 <inShutdown>
 	atomic.StoreInt32(&srv.inShutdown, 1)
 
 	srv.mu.Lock()
+	// 关闭所有的 listener
 	lnerr := srv.closeListenersLocked()
+	// close <doneChan>
 	srv.closeDoneChanLocked()
+	// 调用 <onShutdown> 回调(不会等待结束)
 	for _, f := range srv.onShutdown {
 		go f()
 	}
 	srv.mu.Unlock()
 
+	// 周期性执行 closeIdleConns(), 即周期性清理所有 idle conn
+	// 意味着只有等待所有的conn变为idle后, shutdown才会结束
 	ticker := time.NewTicker(shutdownPollInterval)
 	defer ticker.Stop()
 	for {
@@ -2703,20 +2726,26 @@ func (s *Server) closeIdleConns() bool {
 	defer s.mu.Unlock()
 	quiescent := true
 	for c := range s.activeConn {
+		// 读取conn的状态[st]与状态设置时间戳[unixSec]
 		st, unixSec := c.getState()
+		// 如果新连接太久没处理, 设置为'StateIdle'
 		// Issue 22682: treat StateNew connections as if
 		// they're idle if we haven't read the first request's
 		// header in over 5 seconds.
 		if st == StateNew && unixSec < time.Now().Unix()-5 {
 			st = StateIdle
 		}
+		// 跳过 状态部位'StateIdle' 或者 刚建立的连接
 		if st != StateIdle || unixSec == 0 {
 			// Assume unixSec == 0 means it's a very new
 			// connection, without state set yet.
 			quiescent = false
 			continue
 		}
+		// 到这里, 就是'StateIdle'的conn了
+		// 调用 net.Conn.Close() 关闭实际的连接
 		c.rwc.Close()
+		// 从 activeConn 移除
 		delete(s.activeConn, c)
 	}
 	return quiescent
@@ -2811,17 +2840,21 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 // ListenAndServe always returns a non-nil error. After Shutdown or Close,
 // the returned error is ErrServerClosed.
 func (srv *Server) ListenAndServe() error {
+	// 如果 Server 已经关闭, 直接返回错误
 	if srv.shuttingDown() {
 		return ErrServerClosed
 	}
+	// 默认的addr(默认http端口)
 	addr := srv.Addr
 	if addr == "" {
 		addr = ":http"
 	}
+	// 创建 net.Listener, 监听tcp的<Addr>端口
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
+	// 调用 Serve() 处理新的连接
 	return srv.Serve(ln)
 }
 
@@ -2868,14 +2901,17 @@ func (srv *Server) Serve(l net.Listener) error {
 		fn(srv, l) // call hook with unwrapped listener
 	}
 
+	// warp listener 为 onceCloseListener, 保证 l.Close() 只被调用一次
 	origListener := l
 	l = &onceCloseListener{Listener: l}
 	defer l.Close()
 
+	// 准备HTTP2的Serve
 	if err := srv.setupHTTP2_Serve(); err != nil {
 		return err
 	}
 
+	// 记录[l]至<listeners>, 回滚删除
 	if !srv.trackListener(&l, true) {
 		return ErrServerClosed
 	}
@@ -2883,6 +2919,7 @@ func (srv *Server) Serve(l net.Listener) error {
 
 	var tempDelay time.Duration // how long to sleep on accept failure
 
+	// 根据<BaseContext>创建context, 默认为 context.Background()
 	baseCtx := context.Background()
 	if srv.BaseContext != nil {
 		baseCtx = srv.BaseContext(origListener)
@@ -2891,15 +2928,19 @@ func (srv *Server) Serve(l net.Listener) error {
 		}
 	}
 
+	// context加入: &contextKey{"http-server"}:Server对象
 	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
 	for {
+		// 调用 listener.Accept() 接受新的连接
 		rw, e := l.Accept()
 		if e != nil {
+			// 处理整个Server退出的情况
 			select {
 			case <-srv.getDoneChan():
 				return ErrServerClosed
 			default:
 			}
+			// 如果是 Temporary Error, sleep 后继续
 			if ne, ok := e.(net.Error); ok && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
@@ -2913,8 +2954,10 @@ func (srv *Server) Serve(l net.Listener) error {
 				time.Sleep(tempDelay)
 				continue
 			}
+			// 其他错误, 取消 整个Serve
 			return e
 		}
+		// copy ctx, 根据<ConnContext>得到传递给连接的context
 		connCtx := ctx
 		if cc := srv.ConnContext; cc != nil {
 			connCtx = cc(connCtx, rw)
@@ -2923,8 +2966,10 @@ func (srv *Server) Serve(l net.Listener) error {
 			}
 		}
 		tempDelay = 0
+		// 根据 net.Conn 构建conn对象, 并设置State为'StateNew'
 		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew) // before Serve can return
+		// 启动goroutine来进行 conn.serve() 处理连接
 		go c.serve(connCtx)
 	}
 }
@@ -2943,17 +2988,20 @@ func (srv *Server) Serve(l net.Listener) error {
 // ServeTLS always returns a non-nil error. After Shutdown or Close, the
 // returned error is ErrServerClosed.
 func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
+	// 设置 HTTP2 TLS
 	// Setup HTTP/2 before srv.Serve, to initialize srv.TLSConfig
 	// before we clone it and create the TLS Listener.
 	if err := srv.setupHTTP2_ServeTLS(); err != nil {
 		return err
 	}
 
+	// copy <TLSConfig>
 	config := cloneTLSConfig(srv.TLSConfig)
 	if !strSliceContains(config.NextProtos, "http/1.1") {
 		config.NextProtos = append(config.NextProtos, "http/1.1")
 	}
 
+	// 读取 certFile 与 keyFile 得到 Certificates对象, 保存到config中
 	configHasCert := len(config.Certificates) > 0 || config.GetCertificate != nil
 	if !configHasCert || certFile != "" || keyFile != "" {
 		var err error
@@ -2964,6 +3012,8 @@ func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
 		}
 	}
 
+	// 创建包含 tlsconfig 的listener, 调用 Serve() 处理
+	// tls listener 的Accept()会返回 tls.Conn
 	tlsListener := tls.NewListener(l, config)
 	return srv.Serve(tlsListener)
 }
@@ -3037,12 +3087,14 @@ func (s *Server) shuttingDown() bool {
 // resource-constrained environments or servers in the process of
 // shutting down should disable them.
 func (srv *Server) SetKeepAlivesEnabled(v bool) {
+	// 设置<disableKeepAlives>
 	if v {
 		atomic.StoreInt32(&srv.disableKeepAlives, 0)
 		return
 	}
 	atomic.StoreInt32(&srv.disableKeepAlives, 1)
 
+	// 关闭HTTP1的空闲连接
 	// Close idle HTTP/1 conns:
 	srv.closeIdleConns()
 
@@ -3110,11 +3162,13 @@ func (srv *Server) ListenAndServeTLS(certFile, keyFile string) error {
 	if srv.shuttingDown() {
 		return ErrServerClosed
 	}
+	// 确定addr
 	addr := srv.Addr
 	if addr == "" {
 		addr = ":https"
 	}
 
+	// 建立监听, 返回 net.Listener 对象
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
