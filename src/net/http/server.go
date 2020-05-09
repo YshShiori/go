@@ -942,6 +942,8 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		wholeReqDeadline time.Time // or zero if none
 		hdrDeadline      time.Time // or zero if none
 	)
+
+	// 设置 ReadDeadline + WriteDeadline
 	t0 := time.Now()
 	if d := c.server.readHeaderTimeout(); d != 0 {
 		hdrDeadline = t0.Add(d)
@@ -956,12 +958,16 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		}()
 	}
 
+	// 设置<r>的读取头部数据大小 (默认 1MB(header) + 4096 )
 	c.r.setReadLimit(c.server.initialReadLimitSize())
+	// 对于 post 的 兼容
 	if c.lastMethod == "POST" {
 		// RFC 7230 section 3 tolerance for old buggy clients.
 		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
 		c.bufr.Discard(numLeadingCRorLF(peek))
 	}
+
+	// 读取request内容 (实际读取的内容为: 请求行+请求头部, 并且设置了req.Body)
 	req, err := readRequest(c.bufr, keepHostHeader)
 	if err != nil {
 		if c.r.hitReadLimit() {
@@ -974,9 +980,13 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		return nil, badRequestError("unsupported protocol version")
 	}
 
+	// 记录 Method
 	c.lastMethod = req.Method
+
+	// 要读取 请求数据 了, 设置读取大小不限
 	c.r.setInfiniteReadLimit()
 
+	// 请求头部的检查
 	hosts, haveHost := req.Header["Host"]
 	isH2Upgrade := req.isH2Upgrade()
 	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
@@ -998,8 +1008,10 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 			}
 		}
 	}
+	// Host值在req.Host属性中有了, Header中移除
 	delete(req.Header, "Host")
 
+	// 设置 Request 其他的属性
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
@@ -1013,6 +1025,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		c.rwc.SetReadDeadline(wholeReqDeadline)
 	}
 
+	// 构建resp
 	w = &response{
 		conn:          c,
 		cancelCtx:     cancelCtx,
@@ -1758,28 +1771,39 @@ func isCommonNetReadError(err error) bool {
 
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
+	// 执行到这里, 是实际的连接已经建立, 但是还没有读写
+
+	// 读取addr保存到<remoteAddr>
 	c.remoteAddr = c.rwc.RemoteAddr().String()
+	// warp ctx
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	defer func() {
+		// 这里做了recover
 		if err := recover(); err != nil && err != ErrAbortHandler {
 			const size = 64 << 10
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
 			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
 		}
+		// conn没有被hijack, 那么serve退出就代表关闭了
 		if !c.hijacked() {
+			// 执行 close + 设置state
 			c.close()
 			c.setState(c.rwc, StateClosed)
 		}
 	}()
 
+	// 如果是tls, 进行 Handshake
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
+		// 读写前设置 rw deadline
 		if d := c.server.ReadTimeout; d != 0 {
 			c.rwc.SetReadDeadline(time.Now().Add(d))
 		}
 		if d := c.server.WriteTimeout; d != 0 {
 			c.rwc.SetWriteDeadline(time.Now().Add(d))
 		}
+		// 先执行 Handshake, 即进行tls鉴权
+		// 如果失败, 那么整个serve就直接退出了
 		if err := tlsConn.Handshake(); err != nil {
 			// If the handshake failed due to the client not speaking
 			// TLS, assume they're speaking plaintext HTTP and write a
@@ -1792,6 +1816,7 @@ func (c *conn) serve(ctx context.Context) {
 			c.server.logf("http: TLS handshake error from %s: %v", c.rwc.RemoteAddr(), err)
 			return
 		}
+		// tls handshake成功, 设置<tlsState>
 		c.tlsState = new(tls.ConnectionState)
 		*c.tlsState = tlsConn.ConnectionState()
 		if proto := c.tlsState.NegotiatedProtocol; validNPN(proto) {
@@ -1805,15 +1830,24 @@ func (c *conn) serve(ctx context.Context) {
 
 	// HTTP/1.x from here on.
 
+	// wrap ctx, 加上 cancel函数
 	ctx, cancelCtx := context.WithCancel(ctx)
 	c.cancelCtx = cancelCtx
 	defer cancelCtx()
 
+	// 创建需要使用的 connReader
+	// connReader 提供了每次读取限制大小数据的功能
 	c.r = &connReader{conn: c}
+	// 创建需要使用的 bufReader, bufWrite
+	// bufReader 传入的是 <r>, 即从conn读取内容
+	// bufReader 使用了 sync.Pool (可以学习怎么使用)
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
+	// 永久循环: 读取req -> 返回resp
 	for {
+		// 读取 request
+		// 返回的resp中, 请求header已经被解析到resp.req, 请求的body通过resp.Body读取
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
@@ -1860,6 +1894,7 @@ func (c *conn) serve(ctx context.Context) {
 			}
 		}
 
+		// 处理Header包含 "Expect":"100 Continue"
 		// Expect 100 Continue support
 		req := w.req
 		if req.expectsContinue() {
@@ -1872,6 +1907,7 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
+		// 将resp(包括req)保存到<curReq>中
 		c.curReq.Store(w)
 
 		if requestBodyRemains(req.Body) {
@@ -1880,6 +1916,8 @@ func (c *conn) serve(ctx context.Context) {
 			w.conn.r.startBackgroundRead()
 		}
 
+		// 调用 Server.Handler.ServeHTTP() 处理请求
+		// Handler 其实就是 ServerMux, 所以这里最后是交给用户自定义的处理方法处理了
 		// HTTP cannot have multiple simultaneous active requests.[*]
 		// Until the server replies to this request, it can't read another,
 		// so we might as well run the handler in this goroutine.
@@ -1892,16 +1930,26 @@ func (c *conn) serve(ctx context.Context) {
 		if c.hijacked() {
 			return
 		}
+		// 完成一个调用, 进行close, flush 操作
+		// 这里不会关闭实际conn, 因为会想着要复用
 		w.finishRequest()
+
+		// 判断连接是否可以复用, 不能复用就直接退出serve了
 		if !w.shouldReuseConnection() {
 			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
 				c.closeWriteAndWait()
 			}
 			return
 		}
+
+		// 开始准备复用连接
+		// 下面如果正常流程, for循环就继续, 那么连接就复用了
+
+		// 设置conn状态为idle, 丢弃前面用完的resp
 		c.setState(c.rwc, StateIdle)
 		c.curReq.Store((*response)(nil))
 
+		// 判断是否alive
 		if !w.conn.server.doKeepAlives() {
 			// We're in shutdown mode. We might've replied
 			// to the user without "Connection: close" and
@@ -1910,6 +1958,8 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
+		// 尝试 read conn, 看连接是否还正常
+		// Peek 4, 如同 readRequest() 一样
 		if d := c.server.idleTimeout(); d != 0 {
 			c.rwc.SetReadDeadline(time.Now().Add(d))
 			if _, err := c.bufr.Peek(4); err != nil {
@@ -2821,6 +2871,7 @@ type serverHandler struct {
 }
 
 func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+	// 调用 Server.Handler.ServeHTTP() Handler就是ServeMux
 	handler := sh.srv.Handler
 	if handler == nil {
 		handler = DefaultServeMux

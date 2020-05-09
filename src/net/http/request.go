@@ -1007,6 +1007,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 	tp := newTextprotoReader(b)
 	req = new(Request)
 
+	// 读取 请求行, 即HTTP的第一行
 	// First line: GET /index.html HTTP/1.0
 	var s string
 	if s, err = tp.ReadLine(); err != nil {
@@ -1019,6 +1020,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 		}
 	}()
 
+	// 解析第一行, 得到Method、URI、Proto
 	var ok bool
 	req.Method, req.RequestURI, req.Proto, ok = parseRequestLine(s)
 	if !ok {
@@ -1046,6 +1048,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 		rawurl = "http://" + rawurl
 	}
 
+	// 解析url, 赋值到request.URL
 	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
 		return nil, err
 	}
@@ -1055,6 +1058,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 		req.URL.Scheme = ""
 	}
 
+	// 读取所有 Header, 赋值到request.Header
 	// Subsequent lines: Key: value.
 	mimeHeader, err := tp.ReadMIMEHeader()
 	if err != nil {
@@ -1062,6 +1066,7 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 	}
 	req.Header = Header(mimeHeader)
 
+	// 赋值 request.Host
 	// RFC 7230, section 5.3: Must treat
 	//	GET /index.html HTTP/1.1
 	//	Host: www.google.com
@@ -1081,11 +1086,14 @@ func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err erro
 
 	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
+	// 将 reader 传输到 req.Body 上
+	// 初步理解为: 每次Read()就是将 conn.Read() -> 解析 -> 传输
 	err = readTransfer(req, b)
 	if err != nil {
 		return nil, err
 	}
 
+	// 处理 HTTP2
 	if req.isH2Upgrade() {
 		// Because it's neither chunked, nor declared:
 		req.ContentLength = -1
